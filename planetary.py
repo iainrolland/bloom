@@ -1,8 +1,12 @@
+import code
+
+import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import timedelta
 import planetary_computer as pc
 from pystac_client import Client
 import geopy.distance as distance
+import json
 import rioxarray
 from IPython.display import Image
 from PIL import Image as PILImage
@@ -17,6 +21,24 @@ import data_load
 import os
 
 IMAGE_ARRAY_DIR = "images/"
+
+
+def dec2bin_bitwise2(x, bits=8):
+    """2d input"""
+    shp = x.shape
+    return ((x.ravel()[:, None] & (1 << np.arange(bits - 1, -1, -1))) > 0).astype(np.uint8).reshape((*shp, bits))
+
+
+def is_water(qa):
+    return dec2bin_bitwise2(qa, bits=16)[..., -8] == 1
+
+
+def is_cloud(qa):
+    return dec2bin_bitwise2(qa, bits=16)[..., -4] == 1
+
+
+def is_cloud_shadow(qa):
+    return dec2bin_bitwise2(qa, bits=16)[..., -5] == 1
 
 
 def select_best_item(items, date, latitude, longitude):
@@ -50,7 +72,7 @@ def select_best_item(items, date, latitude, longitude):
             & (item_details.min_long < longitude)
             & (item_details.max_long > longitude)
     )
-    item_details = item_details[item_details["contains_sample_point"] == True]
+    item_details = item_details[item_details["contains_sample_point"] == True]  # filter to only those which contain
     if len(item_details) == 0:
         return np.nan, np.nan, np.nan
 
@@ -59,17 +81,25 @@ def select_best_item(items, date, latitude, longitude):
         item_details["datetime"]
     )
 
-    # if we have sentinel-2, filter to sentinel-2 images only
+    # flag: sentinel-2
     item_details["sentinel"] = item_details.platform.str.lower().str.contains(
         "sentinel"
     )
-    if item_details["sentinel"].any():
-        item_details = item_details[item_details["sentinel"] == True]
+    # flag: landsat
+    item_details["landsat"] = item_details.platform.str.lower().str.contains(
+        "landsat"
+    )
+    if item_details["sentinel"].any():  # if sentinel exists, filter to just those
+        sentinel = item_details[item_details["sentinel"] == True].sort_values(by="time_diff", ascending=True)
+    else:
+        sentinel = None
+    if item_details["landsat"].any():  # if landsat exists, filter to just those
+        landsat = item_details[item_details["landsat"] == True].sort_values(by="time_diff", ascending=True)
+    else:
+        landsat = None
 
-    # return the closest imagery by time
-    best_item = item_details.sort_values(by="time_diff", ascending=True).iloc[0]
-
-    return best_item["item_obj"], best_item["platform"], best_item["datetime"]
+    # return best_item["item_obj"], best_item["platform"], best_item["datetime"]
+    return sentinel, landsat
 
 
 def get_date_range(date, time_buffer_days=15):
@@ -104,7 +134,7 @@ def get_bounding_box(latitude, longitude, meter_buffer=50000):
     return [min_long, min_lat, max_long, max_lat]
 
 
-def crop_sentinel_image(item, bounding_box):
+def crop_sentinel_image(item_df, bounding_box):
     """
     Given a STAC item from Sentinel-2 and a bounding box tuple in the format
     (minx, miny, maxx, maxy), return a cropped portion of the item's visual
@@ -114,18 +144,42 @@ def crop_sentinel_image(item, bounding_box):
     """
     (minx, miny, maxx, maxy) = bounding_box
 
-    image = rioxarray.open_rasterio(pc.sign(item.assets["visual"].href)).rio.clip_box(
-        minx=minx,
-        miny=miny,
-        maxx=maxx,
-        maxy=maxy,
-        crs="EPSG:4326",
-    )
+    for item in item_df.iterrows():
+        image = rioxarray.open_rasterio(pc.sign(item[1]["item_obj"].assets["visual"].href)).rio.clip_box(
+            minx=minx,
+            miny=miny,
+            maxx=maxx,
+            maxy=maxy,
+            crs="EPSG:4326",
+        ).to_numpy()
+        cloud = rioxarray.open_rasterio(pc.sign(item[1]["item_obj"].assets["SCL"].href)).rio.clip_box(
+            minx=minx,
+            miny=miny,
+            maxx=maxx,
+            maxy=maxy,
+            crs="EPSG:4326",
+        ).to_numpy()
+        if np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9])) > .4:  # if excluded classes account for >40% of pixels, ignore
+            # print(f"{np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))} - rejecting...")
+            # fig, ax = plt.subplots(1, 2)
+            # ax[0].imshow(np.rollaxis(image, 0, 3))
+            # ax[1].matshow(cloud[0])
+            # fig.suptitle(f"rejected {np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))}")
+            # plt.show()
+            continue  # do the next row in item_df
+        # print(f"{np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))} - accepting...")
+        # fig, ax = plt.subplots(1, 2)
+        # ax[0].imshow(np.rollaxis(image, 0, 3))
+        # ax[1].matshow(cloud[0])
+        # fig.suptitle(f"accepted {np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))}")
+        # plt.show()
 
-    return image.to_numpy()
+        return image, cloud, item[1]["item_obj"], item[1]["platform"], item[1]["datetime"]
+
+    return None, None, None, None, None  # if no images <=40% excluded pixels
 
 
-def crop_landsat_image(item, bounding_box):
+def crop_landsat_image(item_df, bounding_box):
     """
     Given a STAC item from Landsat and a bounding box tuple in the format
     (minx, miny, maxx, maxy), return a cropped portion of the item's visual
@@ -135,84 +189,22 @@ def crop_landsat_image(item, bounding_box):
     """
     (minx, miny, maxx, maxy) = bounding_box
 
-    image = odc.stac.stac_load(
-        [pc.sign(item)], bands=["red", "green", "blue"], bbox=[minx, miny, maxx, maxy]
-    ).isel(time=0)
-    image_array = image[["red", "green", "blue"]].to_array().to_numpy()
+    for item in item_df.iterrows():
+        image = odc.stac.stac_load(
+            [pc.sign(item[1]["item_obj"])], bands=["red", "green", "blue", "qa_pixel"], bbox=[minx, miny, maxx, maxy]
+        ).isel(time=0)
+        image_array = image[["red", "green", "blue", "qa_pixel"]].to_array().to_numpy()
+        cloud_mask = is_cloud(image_array[-1, ...])
+        cloud_shadow_mask = is_cloud_shadow(image_array[-1, ...])
+        water_mask = is_water(image_array[-1, ...])
+        if np.mean(np.bitwise_or(cloud_mask, cloud_shadow_mask)) > 0.4:  # excluded if clouds/shadows >40% of image
+            continue  # do the next row in item_df
 
-    # normalize to 0 - 255 values
-    image_array = cv2.normalize(image_array, None, 0, 255, cv2.NORM_MINMAX)
+        # normalize to 0 - 255 values
+        image_array = cv2.normalize(image_array[:3], None, 0, 255, cv2.NORM_MINMAX)
+        return image_array, water_mask, item[1]["item_obj"], item[1]["platform"], item[1]["datetime"]
 
-    return image_array
-
-
-def main():
-    catalog = Client.open(
-        "https://planetarycomputer.microsoft.com/api/stac/v1", modifier=pc.sign_inplace
-    )
-    metadata = data_load.load_metadata()
-    example_row = metadata[metadata.uid == "garm"].iloc[0]
-    date_range = get_date_range(example_row.date)
-    bbox = get_bounding_box(example_row.latitude, example_row.longitude, meter_buffer=50000)
-
-    search = catalog.search(
-        collections=["sentinel-2-l2a", "landsat-c2-l2"], bbox=bbox, datetime=date_range
-    )
-    items = [item for item in search.item_collection()]
-    print(items)
-
-    # get details of all of the items returned
-    item_details = pd.DataFrame(
-        [
-            {
-                "datetime": item.datetime.strftime("%Y-%m-%d"),
-                "platform": item.properties["platform"],
-                "min_long": item.bbox[0],
-                "max_long": item.bbox[2],
-                "min_lat": item.bbox[1],
-                "max_lat": item.bbox[3],
-                "bbox": item.bbox,
-                "item_obj": item,
-            }
-            for item in items
-        ]
-    )
-
-    # check which rows actually contain the sample location
-    item_details["contains_sample_point"] = (
-            (item_details.min_lat < example_row.latitude)
-            & (item_details.max_lat > example_row.latitude)
-            & (item_details.min_long < example_row.longitude)
-            & (item_details.max_long > example_row.longitude)
-    )
-
-    print(
-        f"Filtering from {len(item_details)} returned to {item_details.contains_sample_point.sum()} items that contain the sample location"
-    )
-
-    item_details = item_details[item_details["contains_sample_point"]]
-    item_details[["datetime", "platform", "contains_sample_point", "bbox"]].sort_values(
-        by="datetime"
-    )
-    # filter to sentinel and take the closest date
-    best_item = (
-        item_details[item_details.platform.str.contains("Sentinel")]
-        .sort_values(by="datetime", ascending=False)
-        .iloc[0]
-    )
-    item = best_item.item_obj
-    # get a smaller geographic bounding box
-    minx, miny, maxx, maxy = get_bounding_box(
-        example_row.latitude, example_row.longitude, meter_buffer=3000
-    )
-
-    # get the zoomed in image array
-    bbox = (minx, miny, maxx, maxy)
-    zoomed_img_array = crop_sentinel_image(item, bbox)
-
-    fig, ax = plt.subplots()
-    ax.imshow(np.rollaxis(zoomed_img_array, 0, 3))
-    plt.show()
+    return None, None, None, None, None
 
 
 def download():
@@ -220,18 +212,18 @@ def download():
         "https://planetarycomputer.microsoft.com/api/stac/v1", modifier=pc.sign_inplace
     )
 
-    # save outputs in dictionaries
-    selected_items = {}
-    features_dict = {}
-    errored_ids = []
-
     metadata = data_load.load_metadata()
 
     for row in tqdm(metadata.itertuples(), total=len(metadata)):
-        # check if we've already saved the selected image array
-        image_array_pth = os.path.join(IMAGE_ARRAY_DIR, f"{row.uid}.npy")
+        sen_img_pth = os.path.join(IMAGE_ARRAY_DIR, f"sen2_{row.uid}_img.npy")
+        sen_scl_pth = os.path.join(IMAGE_ARRAY_DIR, f"sen2_{row.uid}_scl.npy")
+        sen_metadata_pth = os.path.join(IMAGE_ARRAY_DIR, f"sen2_{row.uid}_metadata.json")
+        landsat_img_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_img.npy")
+        landsat_water_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_water_mask.npy")
+        landsat_metadata_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_metadata.json")
 
-        if not os.path.isfile(image_array_pth):
+        # if not os.path.isfile(image_array_pth):
+        if True:
             try:
                 # QUERY STAC API
                 # get query ranges for location and date
@@ -250,39 +242,49 @@ def download():
 
                 # GET BEST IMAGE
                 if len(items) == 0:
-                    raise Exception
+                    raise NoDataInBounds
                 else:
-                    best_item, item_platform, item_date = select_best_item(
-                        items, row.date, row.latitude, row.longitude
-                    )
-                    # add to dictionary tracking best items
-                    selected_items[row.uid] = {
-                        "item_object": best_item,
-                        "item_platform": item_platform,
-                        "item_date": item_date,
-                    }
+                    sentinel, landsat = select_best_item(items, row.date, row.latitude, row.longitude)
 
                 feature_bbox = get_bounding_box(
                     row.latitude, row.longitude, meter_buffer=100
                 )
 
-                # crop the image
-                if "sentinel" in item_platform.lower():
-                    image_array = crop_sentinel_image(best_item, feature_bbox)
-                else:
-                    image_array = crop_landsat_image(best_item, feature_bbox)
+                if sentinel is not None:
+                    sentinel_img, sentinel_cloud, best_item, item_platform, item_date = crop_sentinel_image(
+                        sentinel,
+                        feature_bbox
+                    )
+                    if sentinel_img is not None:
+                        np.save(sen_img_pth, sentinel_img)
+                        np.save(sen_scl_pth, sentinel_cloud)
+                        with open(sen_metadata_pth, 'w') as f:
+                            # code.interact(local=locals())
+                            json.dump({
+                                "item_object": best_item.id,
+                                "item_platform": item_platform,
+                                "item_date": item_date,
+                            }, f)
 
-                # save image array so we don't have to rerun
-                with open(image_array_pth, "wb") as f:
-                    np.save(image_array_pth, image_array)
+                if landsat is not None:
+                    landsat_img, landsat_water_mask, best_item, item_platform, item_date = crop_landsat_image(
+                        landsat,
+                        feature_bbox
+                    )
+                    if landsat_img is not None:
+                        np.save(landsat_img_pth, landsat_img)
+                        np.save(landsat_water_pth, landsat_water_mask)
+                        with open(landsat_metadata_pth, 'w') as f:
+                            json.dump({
+                                "item_object": best_item.id,
+                                "item_platform": item_platform,
+                                "item_date": item_date,
+                            }, f)
 
             # keep track of any that ran into errors without interrupting the process
             except NoDataInBounds:
-                errored_ids.append(row.uid)
                 print(row.uid)
 
 
 if __name__ == '__main__':
-    # print(df[df.split == "train"])  # 17060 training samples
-    # main()
     download()
