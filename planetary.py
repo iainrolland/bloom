@@ -6,6 +6,9 @@ import geopy.distance as distance
 import rioxarray
 from IPython.display import Image
 from PIL import Image as PILImage
+from rioxarray.exceptions import NoDataInBounds
+import odc.stac
+import cv2
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -225,58 +228,58 @@ def download():
     metadata = data_load.load_metadata()
 
     for row in tqdm(metadata.itertuples(), total=len(metadata)):
-        pass
         # check if we've already saved the selected image array
         image_array_pth = os.path.join(IMAGE_ARRAY_DIR, f"{row.uid}.npy")
 
-        try:
-            # QUERY STAC API
-            # get query ranges for location and date
-            search_bbox = get_bounding_box(
-                row.latitude, row.longitude, meter_buffer=50000
-            )
-            date_range = get_date_range(row.date, time_buffer_days=15)
-
-            # search the planetary computer
-            search = catalog.search(
-                collections=["sentinel-2-l2a", "landsat-c2-l2"],
-                bbox=search_bbox,
-                datetime=date_range,
-            )
-            items = [item for item in search.item_collection()]
-
-            # GET BEST IMAGE
-            if len(items) == 0:
-                raise Exception
-            else:
-                best_item, item_platform, item_date = select_best_item(
-                    items, row.date, row.latitude, row.longitude
+        if not os.path.isfile(image_array_pth):
+            try:
+                # QUERY STAC API
+                # get query ranges for location and date
+                search_bbox = get_bounding_box(
+                    row.latitude, row.longitude, meter_buffer=50000
                 )
-                # add to dictionary tracking best items
-                selected_items[row.uid] = {
-                    "item_object": best_item,
-                    "item_platform": item_platform,
-                    "item_date": item_date,
-                }
+                date_range = get_date_range(row.date, time_buffer_days=15)
 
-            feature_bbox = get_bounding_box(
-                row.latitude, row.longitude, meter_buffer=100
-            )
+                # search the planetary computer
+                search = catalog.search(
+                    collections=["sentinel-2-l2a", "landsat-c2-l2"],
+                    bbox=search_bbox,
+                    datetime=date_range,
+                )
+                items = [item for item in search.item_collection()]
 
-            # crop the image
-            if "sentinel" in item_platform.lower():
-                image_array = crop_sentinel_image(best_item, feature_bbox)
-            else:
-                image_array = crop_landsat_image(best_item, feature_bbox)
+                # GET BEST IMAGE
+                if len(items) == 0:
+                    raise Exception
+                else:
+                    best_item, item_platform, item_date = select_best_item(
+                        items, row.date, row.latitude, row.longitude
+                    )
+                    # add to dictionary tracking best items
+                    selected_items[row.uid] = {
+                        "item_object": best_item,
+                        "item_platform": item_platform,
+                        "item_date": item_date,
+                    }
 
-            # save image array so we don't have to rerun
-            with open(image_array_pth, "wb") as f:
-                np.save(image_array_pth, image_array)
+                feature_bbox = get_bounding_box(
+                    row.latitude, row.longitude, meter_buffer=100
+                )
 
-        # keep track of any that ran into errors without interrupting the process
-        except:
-            errored_ids.append(row.uid)
-            print(row.uid)
+                # crop the image
+                if "sentinel" in item_platform.lower():
+                    image_array = crop_sentinel_image(best_item, feature_bbox)
+                else:
+                    image_array = crop_landsat_image(best_item, feature_bbox)
+
+                # save image array so we don't have to rerun
+                with open(image_array_pth, "wb") as f:
+                    np.save(image_array_pth, image_array)
+
+            # keep track of any that ran into errors without interrupting the process
+            except NoDataInBounds:
+                errored_ids.append(row.uid)
+                print(row.uid)
 
 
 if __name__ == '__main__':
