@@ -1,6 +1,3 @@
-import code
-
-import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import timedelta
 import planetary_computer as pc
@@ -8,14 +5,11 @@ from pystac_client import Client
 import geopy.distance as distance
 import json
 import rioxarray
-from IPython.display import Image
-from PIL import Image as PILImage
 from rioxarray.exceptions import NoDataInBounds
 import odc.stac
 import cv2
 from tqdm import tqdm
 import numpy as np
-import matplotlib.pyplot as plt
 
 import data_load
 import os
@@ -160,19 +154,7 @@ def crop_sentinel_image(item_df, bounding_box):
             crs="EPSG:4326",
         ).to_numpy()
         if np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9])) > .4:  # if excluded classes account for >40% of pixels, ignore
-            # print(f"{np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))} - rejecting...")
-            # fig, ax = plt.subplots(1, 2)
-            # ax[0].imshow(np.rollaxis(image, 0, 3))
-            # ax[1].matshow(cloud[0])
-            # fig.suptitle(f"rejected {np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))}")
-            # plt.show()
             continue  # do the next row in item_df
-        # print(f"{np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))} - accepting...")
-        # fig, ax = plt.subplots(1, 2)
-        # ax[0].imshow(np.rollaxis(image, 0, 3))
-        # ax[1].matshow(cloud[0])
-        # fig.suptitle(f"accepted {np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9]))}")
-        # plt.show()
 
         return image, cloud, item[1]["item_obj"], item[1]["platform"], item[1]["datetime"]
 
@@ -199,6 +181,8 @@ def crop_landsat_image(item_df, bounding_box):
         water_mask = is_water(image_array[-1, ...])
         if np.mean(np.bitwise_or(cloud_mask, cloud_shadow_mask)) > 0.4:  # excluded if clouds/shadows >40% of image
             continue  # do the next row in item_df
+        elif np.mean(image_array[:3] == 0) > .1:  # if >10% RGB band pixels have zero data, disregard
+            continue  # image ignored - fails test for missing values
 
         # normalize to 0 - 255 values
         image_array = cv2.normalize(image_array[:3], None, 0, 255, cv2.NORM_MINMAX)
@@ -222,8 +206,7 @@ def download():
         landsat_water_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_water_mask.npy")
         landsat_metadata_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_metadata.json")
 
-        # if not os.path.isfile(image_array_pth):
-        if True:
+        if not os.path.isfile(sen_img_pth) or not os.path.isfile(landsat_img_pth):  # if we haven't already got images
             try:
                 # QUERY STAC API
                 # get query ranges for location and date
@@ -240,7 +223,6 @@ def download():
                 )
                 items = [item for item in search.item_collection()]
 
-                # GET BEST IMAGE
                 if len(items) == 0:
                     raise NoDataInBounds
                 else:
@@ -259,7 +241,6 @@ def download():
                         np.save(sen_img_pth, sentinel_img)
                         np.save(sen_scl_pth, sentinel_cloud)
                         with open(sen_metadata_pth, 'w') as f:
-                            # code.interact(local=locals())
                             json.dump({
                                 "item_object": best_item.id,
                                 "item_platform": item_platform,
