@@ -13,8 +13,9 @@ import numpy as np
 
 import data_load
 import os
+from time import time
 
-IMAGE_ARRAY_DIR = "images/"
+IMAGE_ARRAY_DIR = "data/"
 
 
 def dec2bin_bitwise2(x, bits=8):
@@ -139,26 +140,19 @@ def crop_sentinel_image(item_df, bounding_box):
     (minx, miny, maxx, maxy) = bounding_box
 
     for item in item_df.iterrows():
-        image = rioxarray.open_rasterio(pc.sign(item[1]["item_obj"].assets["visual"].href)).rio.clip_box(
-            minx=minx,
-            miny=miny,
-            maxx=maxx,
-            maxy=maxy,
-            crs="EPSG:4326",
-        ).to_numpy()
-        cloud = rioxarray.open_rasterio(pc.sign(item[1]["item_obj"].assets["SCL"].href)).rio.clip_box(
-            minx=minx,
-            miny=miny,
-            maxx=maxx,
-            maxy=maxy,
-            crs="EPSG:4326",
-        ).to_numpy()
-        if np.mean(np.isin(cloud, [0, 1, 2, 3, 8, 9])) > .4:  # if excluded classes account for >40% of pixels, ignore
+        image = odc.stac.stac_load([pc.sign(item[1]["item_obj"])],
+                                   bands=[f"B0{i}" if i < 10 else f"B{i}" for i in range(1, 13) if i != 10] + ["SCL"],
+                                   bbox=(minx, miny, maxx, maxy)).isel(time=0)
+        if np.mean(np.isin(image["SCL"].to_numpy(), [0, 1, 2, 3, 8, 9])) > .4:
+            # if excl. classes make up >40% of pixels, ignore
+            continue  # do the next row in item_df
+        elif np.mean(np.isnan(image["SCL"].to_numpy())) > .4:
+            # if >40% of pixels are nan
             continue  # do the next row in item_df
 
-        return image, cloud, item[1]["item_obj"], item[1]["platform"], item[1]["datetime"]
+        return image, item[1]["item_obj"], item[1]["platform"], item[1]["datetime"]
 
-    return None, None, None, None, None  # if no images <=40% excluded pixels
+    return None, None, None, None  # if no images <=40% excluded pixels
 
 
 def crop_landsat_image(item_df, bounding_box):
@@ -170,25 +164,27 @@ def crop_landsat_image(item_df, bounding_box):
     Returns the image as a numpy array with dimensions (color band, height, width)
     """
     (minx, miny, maxx, maxy) = bounding_box
+    bands = {
+        "landsat-7": ["blue", "green", "red", "nir08", "swir16", "lwir", "swir22", "qa_pixel"],
+        "landsat-8": ["blue", "green", "red", "nir08", "swir16", "lwir11", "swir22", "qa_pixel"],
+        "landsat-9": ["blue", "green", "red", "nir08", "swir16", "lwir11", "swir22", "qa_pixel"]
+    }
 
     for item in item_df.iterrows():
         image = odc.stac.stac_load(
-            [pc.sign(item[1]["item_obj"])], bands=["red", "green", "blue", "qa_pixel"], bbox=[minx, miny, maxx, maxy]
+            [pc.sign(item[1]["item_obj"])],
+            bands=bands[item[1].platform],
+            bbox=(minx, miny, maxx, maxy)
         ).isel(time=0)
-        image_array = image[["red", "green", "blue", "qa_pixel"]].to_array().to_numpy()
-        cloud_mask = is_cloud(image_array[-1, ...])
-        cloud_shadow_mask = is_cloud_shadow(image_array[-1, ...])
-        water_mask = is_water(image_array[-1, ...])
+        cloud_mask = is_cloud(image["qa_pixel"].to_numpy())
+        cloud_shadow_mask = is_cloud_shadow(image["qa_pixel"].to_numpy())
         if np.mean(np.bitwise_or(cloud_mask, cloud_shadow_mask)) > 0.4:  # excluded if clouds/shadows >40% of image
             continue  # do the next row in item_df
-        elif np.mean(image_array[:3] == 0) > .1:  # if >10% RGB band pixels have zero data, disregard
+        elif np.mean(image.to_array()[:-1, ...] == 0) > .1:  # if >10% RGB band pixels have zero data, disregard
             continue  # image ignored - fails test for missing values
+        return image.astype(np.int32), item[1]["item_obj"], item[1]["platform"], item[1]["datetime"]
 
-        # normalize to 0 - 255 values
-        image_array = cv2.normalize(image_array[:3], None, 0, 255, cv2.NORM_MINMAX)
-        return image_array, water_mask, item[1]["item_obj"], item[1]["platform"], item[1]["datetime"]
-
-    return None, None, None, None, None
+    return None, None, None, None
 
 
 def download():
@@ -199,14 +195,12 @@ def download():
     metadata = data_load.load_metadata()
 
     for row in tqdm(metadata.itertuples(), total=len(metadata)):
-        sen_img_pth = os.path.join(IMAGE_ARRAY_DIR, f"sen2_{row.uid}_img.npy")
-        sen_scl_pth = os.path.join(IMAGE_ARRAY_DIR, f"sen2_{row.uid}_scl.npy")
-        sen_metadata_pth = os.path.join(IMAGE_ARRAY_DIR, f"sen2_{row.uid}_metadata.json")
-        landsat_img_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_img.npy")
-        landsat_water_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_water_mask.npy")
-        landsat_metadata_pth = os.path.join(IMAGE_ARRAY_DIR, f"landsat_{row.uid}_metadata.json")
+        sen_pth = os.path.join(IMAGE_ARRAY_DIR, "sentinel", f"{row.uid}.nc")
+        landsat_pth = os.path.join(IMAGE_ARRAY_DIR, "landsat", f"{row.uid}.nc")
+        sen_metadata_pth = os.path.join(IMAGE_ARRAY_DIR, "sentinel", f"{row.uid}_metadata.json")
+        landsat_metadata_pth = os.path.join(IMAGE_ARRAY_DIR, "landsat", f"{row.uid}_metadata.json")
 
-        if not os.path.isfile(sen_img_pth) or not os.path.isfile(landsat_img_pth):  # if we haven't already got images
+        if not os.path.isfile(sen_pth) or not os.path.isfile(landsat_pth):  # if we haven't already got images
             try:
                 # QUERY STAC API
                 # get query ranges for location and date
@@ -233,13 +227,12 @@ def download():
                 )
 
                 if sentinel is not None:
-                    sentinel_img, sentinel_cloud, best_item, item_platform, item_date = crop_sentinel_image(
+                    sentinel_data, best_item, item_platform, item_date = crop_sentinel_image(
                         sentinel,
                         feature_bbox
                     )
-                    if sentinel_img is not None:
-                        np.save(sen_img_pth, sentinel_img)
-                        np.save(sen_scl_pth, sentinel_cloud)
+                    if sentinel_data is not None:
+                        sentinel_data.to_netcdf(sen_pth)
                         with open(sen_metadata_pth, 'w') as f:
                             json.dump({
                                 "item_object": best_item.id,
@@ -248,13 +241,12 @@ def download():
                             }, f)
 
                 if landsat is not None:
-                    landsat_img, landsat_water_mask, best_item, item_platform, item_date = crop_landsat_image(
+                    landsat_data, best_item, item_platform, item_date = crop_landsat_image(
                         landsat,
                         feature_bbox
                     )
-                    if landsat_img is not None:
-                        np.save(landsat_img_pth, landsat_img)
-                        np.save(landsat_water_pth, landsat_water_mask)
+                    if landsat_data is not None:
+                        landsat_data.to_netcdf(landsat_pth)
                         with open(landsat_metadata_pth, 'w') as f:
                             json.dump({
                                 "item_object": best_item.id,
